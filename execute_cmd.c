@@ -102,6 +102,10 @@ extern int errno;
 #  include "bashhist.h"
 #endif
 
+#if defined (BASH_JIT)
+#  include "bash_jit.h"
+#endif
+
 #if defined (HAVE_MBSTR_H) && defined (HAVE_MBSCHR)
 #  include <mbstr.h>		/* mbschr */
 #endif
@@ -5205,6 +5209,18 @@ execute_function (SHELL_VAR *var, WORD_LIST *words, int flags, struct fd_bitmap 
       jump_to_top_level (DISCARD);
     }
 
+#if defined (BASH_JIT)
+  {
+    COMMAND *jit_cmd = NULL;
+
+    if (bash_jit_function_check (var, words, &jit_cmd)
+        == JIT_CHECK_COMPILED)
+      {
+        return execute_command (jit_cmd);
+      }
+  }
+#endif
+
 #if defined (ARRAY_VARS)
   GET_ARRAY_FROM_VAR ("FUNCNAME", funcname_v, funcname_a);
   GET_ARRAY_FROM_VAR ("BASH_SOURCE", bash_source_v, bash_source_a);
@@ -6334,6 +6350,12 @@ execute_intern_function (WORD_DESC *name, FUNCTION_DEF *funcdef)
 #endif
 
   bind_function (name->word, funcdef->command);
+
+#if defined (BASH_JIT)
+  if (bash_jit_enabled)
+    bash_jit_register_function (name->word, funcdef->command);
+#endif
+
   return (EXECUTION_SUCCESS);
 }
 

@@ -89,6 +89,10 @@ extern int get_tty_state (void);
 #include <tilde/tilde.h>
 #include <glob/strmatch.h>
 
+#if defined (BASH_JIT)
+#  include "bash_jit.h"
+#endif
+
 #if defined (__OPENNT)
 #  include <opennt/opennt.h>
 #endif
@@ -776,7 +780,13 @@ main (int argc, char **argv, char **env)
   /* Get possible input filename and set up default_buffered_input or
      default_input as appropriate. */
   if (shell_script_filename)
-    open_shell_script (shell_script_filename);
+    {
+#if defined (BASH_JIT)
+      if (bash_jit_enabled)
+	bash_jit_try_script (shell_script_filename);
+#endif
+      open_shell_script (shell_script_filename);
+    }
   else if (interactive == 0)
     {
       /* In this mode, bash is reading a script from stdin, which is a
@@ -1963,6 +1973,10 @@ shell_initialize (void)
   initialize_shell_variables (shell_environment, privileged_mode||restricted||should_be_restricted||running_setuid);
 #else
   initialize_shell_variables (shell_environment, privileged_mode||running_setuid);
+#endif
+
+#if defined (BASH_JIT)
+  bash_jit_init ();
 #endif
 
   /* Initialize the data structures for storing and running jobs. */

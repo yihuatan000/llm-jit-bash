@@ -42,6 +42,11 @@
 #include "../parser.h"
 #include "../input.h"
 #include "../execute_cmd.h"
+
+#if defined (BASH_JIT)
+#  include "../bash_jit.h"
+#endif
+
 #include "../redir.h"
 #include "../trap.h"
 #include "../bashintl.h"
@@ -550,22 +555,31 @@ parse_and_execute (char *string, const char *from_file, int flags)
 
 	      /* This functionality is now implemented as part of
 		 subst.c:command_substitute(). */
-#if 0
-	      /* See if this is a candidate for $( <file ). */
-	      if (startup_state == 2 &&
-		  (subshell_environment & SUBSHELL_COMSUB) &&
-		  *bash_input.location.string == '\0' &&
-		  can_optimize_cat_file (command))
-		{
-		  int r;
-INTERNAL_DEBUG(("parse_and_execute: calling cat_file, parse_and_execute_level = %d", parse_and_execute_level));
-		  r = cat_file (command->value.Simple->redirects);
-		  last_result = (r < 0) ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
-		}
-	      else
+#if defined (BASH_JIT)
+		      /* Try JIT-compiled version first for top-level commands. */
+		      if (parse_and_execute_level <= 1)
+			{
+			  COMMAND *jit_cmd = NULL;
+
+			  if (bash_jit_check (command, NULL, &jit_cmd)
+			      == JIT_CHECK_COMPILED)
+			    {
+			      last_result = execute_command (jit_cmd);
+			      dispose_command (jit_cmd);
+			    }
+			  else
+			    {
+			      last_result = execute_command_internal
+					(command, 0, NO_PIPE, NO_PIPE, bitmap);
+			      bash_jit_exec_done ();
+			    }
+			}
+		      else
 #endif
-		last_result = execute_command_internal
-				(command, 0, NO_PIPE, NO_PIPE, bitmap);
+			{
+			  last_result = execute_command_internal
+					(command, 0, NO_PIPE, NO_PIPE, bitmap);
+			}
 	      dispose_command (command);
 	      dispose_fd_bitmap (bitmap);
 	      discard_unwind_frame ("pe_dispose");

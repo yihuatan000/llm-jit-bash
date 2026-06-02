@@ -260,6 +260,7 @@ dnl options that alter how bash is compiled and linked
 AC_ARG_ENABLE(mem-scramble, AS_HELP_STRING([--enable-mem-scramble], [scramble memory on calls to malloc and free]), opt_memscramble=$enableval)
 AC_ARG_ENABLE(profiling, AS_HELP_STRING([--enable-profiling], [allow profiling with gprof]), opt_profiling=$enableval)
 AC_ARG_ENABLE(static-link, AS_HELP_STRING([--enable-static-link], [link bash statically, for use as a root shell]), opt_static_link=$enableval)
+AC_ARG_ENABLE([jit], AS_HELP_STRING([--enable-jit], [Enable JIT compilation via LLM translation]), [opt_jit=$enableval], [opt_jit=no])
 
 dnl So-called `precious' variables
 AC_ARG_VAR([CC_FOR_BUILD], [C compiler used when compiling binaries used only at build time])
@@ -312,6 +313,11 @@ fi
 if test $opt_xpg_echo = yes ; then
 AC_DEFINE(DEFAULT_ECHO_TO_XPG)
 fi
+if test "$opt_jit" = yes; then
+AC_DEFINE(BASH_JIT)
+JIT_O=bash_jit.o
+fi
+AC_SUBST(JIT_O)
 if test $opt_strict_posix = yes; then
 AC_DEFINE(STRICT_POSIX)
 fi

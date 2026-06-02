@@ -186,6 +186,8 @@
 
 #undef ENABLE_NLS
 
+#undef BASH_JIT
+
 /* End of configuration settings controllable by autoconf. */
 /* Other settable options appear in config-top.h. */
 

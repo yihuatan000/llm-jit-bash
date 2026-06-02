@@ -52,6 +52,10 @@
 #  include "jobs.h"
 #endif
 
+#if defined (BASH_JIT)
+#  include "bash_jit.h"
+#endif
+
 static void send_pwd_to_eterm (void);
 static sighandler alrm_catcher (int);
 
@@ -180,7 +184,24 @@ reader_loop (void)
 	      executing = 1;
 	      stdin_redir = 0;
 
-	      execute_command (current_command);
+#if defined (BASH_JIT)
+		      {
+			COMMAND *jit_cmd = NULL;
+			if (bash_jit_check (current_command, NULL, &jit_cmd)
+			    == JIT_CHECK_COMPILED)
+			  {
+			    execute_command (jit_cmd);
+			    dispose_command (jit_cmd);
+			  }
+			else
+			  {
+			    execute_command (current_command);
+			    bash_jit_exec_done ();
+			  }
+		      }
+#else
+		      execute_command (current_command);
+#endif
 
 	    exec_done:
 	      QUIT;

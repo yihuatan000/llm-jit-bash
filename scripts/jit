@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""jit - CLI tool for managing the Bash JIT compilation system.
+
+Usage:
+    jit status              Show daemon status and hot code
+    jit check <file.sh>     Check if a script has compiled cache
+    jit compile <source>    Compile a bash string
+    jit compile <file.sh>   Compile all commands in a script file
+    jit compile --stdin     Compile bash source from stdin
+    jit compile --force ..  Force recompilation
+    jit clear               Clear all compiled cache
+    jit clear --failed      Clear only failed compilations
+    jit clear --compiled    Clear only compiled cache
+    jit stop                Stop the daemon
+    jit start               Start the daemon
+"""
+
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def fnv128_hex(data) -> str:
+    """FNV-1a 128-bit hash matching the C implementation in bash_jit.c."""
+    h1, h2 = 2166136261, 2166136263
+    h3, h4 = h1 ^ 0x5BD1E995, h2 ^ 0x5BD1E995
+    m = 0xFFFFFFFF
+    if isinstance(data, bytes):
+        for b in data:
+            h1 ^= b; h1 = (h1 + ((h1<<1)&m) + ((h1<<4)&m) + ((h1<<7)&m) + ((h1<<8)&m) + ((h1<<24)&m)) & m
+            h2 ^= b; h2 = (h2 + ((h2<<1)&m) + ((h2<<4)&m) + ((h2<<7)&m) + ((h2<<8)&m) + ((h2<<24)&m)) & m
+            h3 ^= b; h3 = (h3 + ((h3<<1)&m) + ((h3<<4)&m) + ((h3<<7)&m) + ((h3<<8)&m) + ((h3<<24)&m)) & m
+            h4 ^= b; h4 = (h4 + ((h4<<1)&m) + ((h4<<4)&m) + ((h4<<7)&m) + ((h4<<8)&m) + ((h4<<24)&m)) & m
+    else:
+        for ch in data:
+            c = ord(ch)
+            h1 ^= c; h1 = (h1 + ((h1<<1)&m) + ((h1<<4)&m) + ((h1<<7)&m) + ((h1<<8)&m) + ((h1<<24)&m)) & m
+            h2 ^= c; h2 = (h2 + ((h2<<1)&m) + ((h2<<4)&m) + ((h2<<7)&m) + ((h2<<8)&m) + ((h2<<24)&m)) & m
+            h3 ^= c; h3 = (h3 + ((h3<<1)&m) + ((h3<<4)&m) + ((h3<<7)&m) + ((h3<<8)&m) + ((h3<<24)&m)) & m
+            h4 ^= c; h4 = (h4 + ((h4<<1)&m) + ((h4<<4)&m) + ((h4<<7)&m) + ((h4<<8)&m) + ((h4<<24)&m)) & m
+    return f"{h1:08x}{h2:08x}{h3:08x}{h4:08x}"
+
+
+def get_socket_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    return os.path.join(runtime, f"bash_jit_{os.getuid()}", "socket")
+
+
+def get_daemon_path():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    daemon = os.path.join(script_dir, "bash_jitd")
+    if os.path.exists(daemon):
+        return daemon
+    return "bash_jitd"
+
+
+async def send_request(msg: dict, timeout: float = 30.0) -> dict:
+    socket_path = get_socket_path()
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(socket_path),
+            timeout=timeout
+        )
+    except (ConnectionRefusedError, FileNotFoundError, asyncio.TimeoutError):
+        return {"type": "error", "message": "daemon not running"}
+
+    data = json.dumps(msg) + "\n"
+    writer.write(data.encode("utf-8"))
+    await writer.drain()
+
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        if not line:
+            return {"type": "error", "message": "empty response"}
+        return json.loads(line.decode("utf-8").strip())
+    except (asyncio.TimeoutError, json.JSONDecodeError) as e:
+        return {"type": "error", "message": str(e)}
+
+
+def cmd_status():
+    try:
+        loop = asyncio.new_event_loop()
+        resp = loop.run_until_complete(send_request({"type": "status"}))
+        loop.close()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+    if resp.get("type") == "error":
+        print(f"Error: {resp.get('message', 'unknown')}")
+        return 1
+
+    print(f"Daemon PID: {resp.get('daemon_pid', 'N/A')}")
+    print(f"Uptime: {resp.get('uptime_seconds', 0)}s")
+    print(f"Total snippets tracked: {resp.get('total_snippets', 0)}")
+    print(f"Compiled: {resp.get('compiled_snippets', 0)}")
+    print(f"Failed: {resp.get('failed_snippets', 0)}")
+    print(f"Total exec events: {resp.get('total_exec_events', 0)}")
+
+    compiling = resp.get("compiling", [])
+    if compiling:
+        print(f"\nCompiling ({len(compiling)}):")
+        for entry in compiling:
+            fp = entry.get("fingerprint", "")
+            preview = entry.get("source_preview", "")[:60]
+            print(f"  {fp}..  {preview}")
+
+    hot = resp.get("top_hot", [])
+    if hot:
+        print("\nTop hot code:")
+        for entry in hot:
+            status = entry.get("status", "unknown")
+            preview = entry.get("source_preview", "")[:60]
+            count = entry.get("count", 0)
+            print(f"  [{status:>13}] count={count:>6}  {preview}")
+
+    return 0
+
+
+def cmd_compile(args):
+    force = "--force" in args or "-f" in args
+    use_stdin = "--stdin" in args
+    args = [a for a in args if a not in ("--force", "-f", "--stdin")]
+
+    if use_stdin:
+        source_bytes = sys.stdin.buffer.read()
+        source_or_file = source_bytes.decode("utf-8", errors="replace")
+        msg = {"type": "compile", "source": source_or_file, "fingerprint": fnv128_hex(source_bytes), "force": force}
+    elif not args:
+        print("Usage: jit compile [--force] [--stdin] <source_or_file>")
+        return 1
+    else:
+        source_or_file = args[0]
+        if os.path.isfile(source_or_file):
+            msg = {"type": "compile_file", "path": os.path.abspath(source_or_file), "force": force}
+        else:
+            msg = {"type": "compile", "source": source_or_file, "force": force}
+
+    try:
+        loop = asyncio.new_event_loop()
+        resp = loop.run_until_complete(send_request(msg, timeout=120))
+        loop.close()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+    if resp.get("type") == "error":
+        print(f"Error: {resp.get('message', 'unknown')}")
+        return 1
+
+    if resp.get("type") == "compile_file_response":
+        snippets = resp.get("snippets", [])
+        print(f"Total: {resp.get('total', 0)}, Compiled: {resp.get('compiled', 0)}, Failed: {resp.get('failed', 0)}")
+        for s in snippets:
+            print(f"  [{s.get('status', 'unknown'):>7}] {s.get('source_preview', '')[:60]}")
+            if s.get("path"):
+                print(f"          -> {s['path']}")
+    else:
+        status = resp.get("status", "unknown")
+        print(f"Status: {status}")
+        if resp.get("path"):
+            print(f"Output: {resp['path']}")
+        if resp.get("error"):
+            print(f"Error: {resp['error']}")
+
+    return 0 if resp.get("status") in ("ok", "skipped") else 1
+
+
+def cmd_clear(args):
+    scope = "all"
+    if "--failed" in args:
+        scope = "failed"
+    elif "--compiled" in args:
+        scope = "compiled"
+
+    try:
+        loop = asyncio.new_event_loop()
+        resp = loop.run_until_complete(send_request({"type": "clear", "scope": scope}))
+        loop.close()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+    if resp.get("type") == "error":
+        print(f"Error: {resp.get('message', 'unknown')}")
+        return 1
+
+    print(f"Removed {resp.get('removed_files', 0)} cache files, {resp.get('removed_counters', 0)} counters")
+    return 0
+
+
+def _fnv128_hex(data: bytes) -> str:
+    """FNV-1a 128-bit hash matching the C implementation in bash_jit.c."""
+    h1, h2 = 2166136261, 2166136263
+    h3, h4 = h1 ^ 0x5BD1E995, h2 ^ 0x5BD1E995
+    m = 0xFFFFFFFF
+    for b in data:
+        h1 ^= b; h1 = (h1 + ((h1<<1)&m) + ((h1<<4)&m) + ((h1<<7)&m) + ((h1<<8)&m) + ((h1<<24)&m)) & m
+        h2 ^= b; h2 = (h2 + ((h2<<1)&m) + ((h2<<4)&m) + ((h2<<7)&m) + ((h2<<8)&m) + ((h2<<24)&m)) & m
+        h3 ^= b; h3 = (h3 + ((h3<<1)&m) + ((h3<<4)&m) + ((h3<<7)&m) + ((h3<<8)&m) + ((h3<<24)&m)) & m
+        h4 ^= b; h4 = (h4 + ((h4<<1)&m) + ((h4<<4)&m) + ((h4<<7)&m) + ((h4<<8)&m) + ((h4<<24)&m)) & m
+    return f"{h1:08x}{h2:08x}{h3:08x}{h4:08x}"
+
+
+def cmd_check(args):
+    if not args:
+        print("Usage: jit check <file.sh>", file=sys.stderr)
+        return 1
+
+    path = args[0]
+    if not os.path.isfile(path):
+        print(f"Error: {path}: not a file", file=sys.stderr)
+        return 1
+
+    with open(path, "rb") as f:
+        content = f.read()
+
+    fp = _fnv128_hex(content)
+    cache_dir = os.environ.get("BASH_JIT_CACHE_DIR", os.path.expanduser("~/.cache/bash_jit"))
+    entry_dir = os.path.join(cache_dir, fp)
+    compiled_py = os.path.join(entry_dir, "compiled.py")
+    meta_json = os.path.join(entry_dir, "meta.json")
+
+    print(f"Script:     {path}")
+    print(f"Fingerprint: {fp}")
+
+    if not os.path.isdir(entry_dir):
+        print("Cache:      not found")
+        return 1
+
+    if os.path.isfile(compiled_py):
+        print(f"Cache:      compiled")
+        print(f"Path:       {compiled_py}")
+    else:
+        print(f"Cache:      no compiled.py (entry exists but compilation may have failed)")
+
+    if os.path.isfile(meta_json):
+        try:
+            with open(meta_json) as f:
+                meta = json.load(f)
+            if meta.get("compiled_at"):
+                print(f"Compiled:   {meta['compiled_at']}")
+            if meta.get("error"):
+                print(f"Error:      {meta['error']}")
+        except Exception:
+            pass
+
+    return 0 if os.path.isfile(compiled_py) else 1
+
+
+def cmd_stop():
+    try:
+        loop = asyncio.new_event_loop()
+        resp = loop.run_until_complete(send_request({"type": "shutdown"}))
+        loop.close()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+    print(resp.get("message", "stopped"))
+    return 0
+
+
+def cmd_start():
+    daemon_path = get_daemon_path()
+    socket_path = get_socket_path()
+
+    # Check if already running
+    if os.path.exists(socket_path):
+        try:
+            loop = asyncio.new_event_loop()
+            resp = loop.run_until_complete(send_request({"type": "status"}, timeout=2))
+            loop.close()
+            if resp.get("type") != "error":
+                print(f"Daemon already running (PID {resp.get('daemon_pid', 'N/A')})")
+                return 0
+        except Exception:
+            pass
+
+    # Start daemon
+    log_dir = os.path.join(os.path.expanduser("~/.cache/bash_jit"))
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "daemon.log")
+    log_file = open(log_path, "a")
+    print(f"Starting daemon: {daemon_path} (log: {log_path})")
+    proc = subprocess.Popen(
+        [sys.executable, daemon_path],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=log_file,
+    )
+
+    # Wait for readiness
+    for _ in range(50):
+        time.sleep(0.1)
+        if os.path.exists(socket_path):
+            try:
+                loop = asyncio.new_event_loop()
+                resp = loop.run_until_complete(send_request({"type": "status"}, timeout=2))
+                loop.close()
+                if resp.get("type") != "error":
+                    print(f"Daemon started (PID {proc.pid})")
+                    return 0
+            except Exception:
+                pass
+
+    print("Daemon failed to start")
+    return 1
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 0
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "status":
+        return cmd_status()
+    elif cmd == "check":
+        return cmd_check(args)
+    elif cmd == "compile":
+        return cmd_compile(args)
+    elif cmd == "clear":
+        return cmd_clear(args)
+    elif cmd == "stop":
+        return cmd_stop()
+    elif cmd == "start":
+        return cmd_start()
+    elif cmd == "log":
+        log_path = os.path.expanduser("~/.cache/bash_jit/daemon.log")
+        n = 50
+        if "--all" in args:
+            n = None
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()
+                for line in lines[-n:] if n else lines:
+                    print(line, end="")
+        except FileNotFoundError:
+            print(f"No log file at {log_path}")
+        return 0
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

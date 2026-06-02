@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""bash_jitd - JIT compilation daemon for Bash.
+
+Receives execution reports from bash processes via Unix domain socket,
+maintains global execution counters, and triggers LLM-based compilation
+when thresholds are crossed.
+"""
+
+import asyncio
+import json
+import os
+import signal
+import sys
+import time
+import hashlib
+import tempfile
+import subprocess
+import shutil
+from pathlib import Path
+from typing import Dict, Optional, Any
+
+
+def fnv128_hex(data) -> str:
+    """FNV-1a 128-bit hash matching the C implementation in bash_jit.c.
+
+    Accepts bytes (preferred, matches C raw-byte processing) or str.
+    For str input, each character's code point is hashed (use only for ASCII).
+    """
+    h1, h2 = 2166136261, 2166136263
+    h3, h4 = h1 ^ 0x5BD1E995, h2 ^ 0x5BD1E995
+    m = 0xFFFFFFFF
+    if isinstance(data, bytes):
+        for b in data:
+            h1 ^= b; h1 = (h1 + ((h1<<1)&m) + ((h1<<4)&m) + ((h1<<7)&m) + ((h1<<8)&m) + ((h1<<24)&m)) & m
+            h2 ^= b; h2 = (h2 + ((h2<<1)&m) + ((h2<<4)&m) + ((h2<<7)&m) + ((h2<<8)&m) + ((h2<<24)&m)) & m
+            h3 ^= b; h3 = (h3 + ((h3<<1)&m) + ((h3<<4)&m) + ((h3<<7)&m) + ((h3<<8)&m) + ((h3<<24)&m)) & m
+            h4 ^= b; h4 = (h4 + ((h4<<1)&m) + ((h4<<4)&m) + ((h4<<7)&m) + ((h4<<8)&m) + ((h4<<24)&m)) & m
+    else:
+        for ch in data:
+            c = ord(ch)
+            h1 ^= c; h1 = (h1 + ((h1<<1)&m) + ((h1<<4)&m) + ((h1<<7)&m) + ((h1<<8)&m) + ((h1<<24)&m)) & m
+            h2 ^= c; h2 = (h2 + ((h2<<1)&m) + ((h2<<4)&m) + ((h2<<7)&m) + ((h2<<8)&m) + ((h2<<24)&m)) & m
+            h3 ^= c; h3 = (h3 + ((h3<<1)&m) + ((h3<<4)&m) + ((h3<<7)&m) + ((h3<<8)&m) + ((h3<<24)&m)) & m
+            h4 ^= c; h4 = (h4 + ((h4<<1)&m) + ((h4<<4)&m) + ((h4<<7)&m) + ((h4<<8)&m) + ((h4<<24)&m)) & m
+    return f"{h1:08x}{h2:08x}{h3:08x}{h4:08x}"
+
+
+class BashJITDaemon:
+    def __init__(self):
+        self.cache_dir = self._get_cache_dir()
+        self.socket_path = self._get_socket_path()
+        self.config = self._load_config()
+        self._log_config()
+
+        # State
+        self.counters: Dict[str, Dict[str, Any]] = {}  # fingerprint -> {count, status, source, context}
+        self.functions: Dict[str, Dict[str, Any]] = {}  # name -> {fingerprint, generation, source}
+        self.sources: Dict[str, str] = {}  # fingerprint -> source text
+        self.contexts: Dict[str, dict] = {}  # fingerprint -> context dict
+        self.durations: Dict[str, Dict[str, Any]] = {}  # fingerprint -> {samples: [ms...], avg_ms}
+
+        # Concurrency
+        self.compile_semaphore = asyncio.Semaphore(
+            self.config.get("max_concurrent_compiles", 3)
+        )
+        self.compiling: set = set()  # fingerprints currently being compiled
+
+        # Persistence
+        self.counters_path = os.path.join(self.cache_dir, "counters.json")
+        self._load_counters()
+
+        # Server
+        self.server = None
+        self.start_time = time.time()
+
+    def _get_cache_dir(self) -> str:
+        cache = os.environ.get("BASH_JIT_CACHE_DIR")
+        if cache:
+            return cache
+        xdg = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+        return os.path.join(xdg, "bash_jit")
+
+    def _get_socket_path(self) -> str:
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+        base = os.path.join(runtime, f"bash_jit_{os.getuid()}")
+        return os.path.join(base, "socket")
+
+    def _load_config(self) -> dict:
+        config_path = os.path.expanduser("~/.config/bash_jit/config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+
+        # Detect API provider from environment variables.
+        # Priority: Anthropic > OpenAI (backward compatible).
+        anthropic_key = (
+            os.environ.get("ANTHROPIC_API_KEY", "")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+        )
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+
+        if anthropic_key:
+            provider = "anthropic"
+            api_key = anthropic_key
+            base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+            if base_url:
+                endpoint = base_url.rstrip("/") + "/v1/messages"
+            else:
+                endpoint = os.environ.get(
+                    "BASH_JIT_LLM_ENDPOINT",
+                    "https://api.anthropic.com/v1/messages"
+                )
+            default_model = "claude-sonnet-4-20250514"
+        elif openai_key:
+            provider = "openai"
+            api_key = openai_key
+            base_url = os.environ.get("OPENAI_BASE_URL", "")
+            if base_url:
+                endpoint = base_url.rstrip("/") + "/chat/completions"
+            else:
+                endpoint = os.environ.get(
+                    "BASH_JIT_LLM_ENDPOINT",
+                    "https://api.openai.com/v1/chat/completions"
+                )
+            default_model = "gpt-4o"
+        else:
+            provider = ""
+            api_key = ""
+            endpoint = ""
+            default_model = ""
+
+        return {
+            "threshold": int(os.environ.get("BASH_JIT_THRESHOLD", "100")),
+            "min_complexity": int(os.environ.get("BASH_JIT_MIN_COMPLEXITY", "50")),
+            "min_duration": int(os.environ.get("BASH_JIT_MIN_DURATION", "50")),
+            "max_concurrent_compiles": 3,
+            "llm": {
+                "provider": provider,
+                "model": os.environ.get("BASH_JIT_LLM_MODEL", default_model),
+                "api_key": api_key,
+                "endpoint": endpoint,
+                "max_tokens": 4096,
+                "temperature": 0,
+            },
+            "cache": {
+                "ttl_days": 30,
+                "max_size_mb": 500,
+            },
+            "validation": {
+                "enabled": True,
+                "timeout_seconds": 5,
+                "trust_verify_count": 5,
+            },
+        }
+
+    def _log_config(self):
+        llm = self.config.get("llm", {})
+        provider = llm.get("provider", "anthropic")
+        endpoint = llm.get("endpoint", "")
+        model = llm.get("model", "")
+        api_key = llm.get("api_key", "")
+        print(f"[config] provider={provider or '(none)'}, "
+              f"model={model or '(none)'}, "
+              f"endpoint={endpoint or '(none)'}, "
+              f"api_key={'*' * 8 + api_key[-4:] if len(api_key) > 4 else 'set' if api_key else 'missing'}",
+              file=sys.stderr)
+
+    def _load_counters(self):
+        if os.path.exists(self.counters_path):
+            try:
+                with open(self.counters_path) as f:
+                    data = json.load(f)
+                for fp, info in data.get("snippets", {}).items():
+                    self.counters[fp] = info
+                    if "source" in info:
+                        self.sources[fp] = info["source"]
+                for name, info in data.get("functions", {}).items():
+                    self.functions[name] = info
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    def _save_counters(self):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        data = {
+            "version": 1,
+            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "snippets": {},
+            "functions": self.functions,
+        }
+        for fp, info in self.counters.items():
+            entry = {"count": info["count"], "status": info.get("status", "not_compiled")}
+            if fp in self.sources:
+                entry["source"] = self.sources[fp]
+            data["snippets"][fp] = entry
+
+        tmp = self.counters_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, self.counters_path)
+
+    async def handle_client(self, reader, writer):
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line.decode("utf-8").strip())
+                    await self._handle_message(msg, writer)
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    print(f"Error handling message: {e}", file=sys.stderr)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _handle_message(self, msg: dict, writer):
+        msg_type = msg.get("type")
+
+        if msg_type == "exec":
+            self._handle_exec(msg)
+        elif msg_type == "exec_script":
+            asyncio.ensure_future(self._handle_exec_script(msg))
+        elif msg_type == "exec_duration":
+            self._handle_exec_duration(msg)
+        elif msg_type == "register_function":
+            self._handle_register_function(msg)
+        elif msg_type == "compile":
+            response = await self._handle_compile(msg)
+            await self._send_response(writer, response)
+        elif msg_type == "compile_file":
+            response = await self._handle_compile_file(msg)
+            await self._send_response(writer, response)
+        elif msg_type == "status":
+            response = self._handle_status()
+            await self._send_response(writer, response)
+        elif msg_type == "clear":
+            response = self._handle_clear(msg)
+            await self._send_response(writer, response)
+        elif msg_type == "shutdown":
+            await self._send_response(writer, {
+                "type": "shutdown_response",
+                "message": "daemon shutting down"
+            })
+            asyncio.get_event_loop().call_later(0.5, self._shutdown)
+        else:
+            await self._send_response(writer, {
+                "type": "error",
+                "message": f"unknown message type: {msg_type}"
+            })
+
+    async def _send_response(self, writer, response: dict):
+        data = json.dumps(response) + "\n"
+        writer.write(data.encode("utf-8"))
+        await writer.drain()
+
+    def _handle_exec(self, msg: dict):
+        fp = msg.get("fingerprint", "")
+        source = msg.get("source", "")
+        context = msg.get("context", {})
+
+        if not fp:
+            return
+
+        # Store source (first time only)
+        if fp not in self.sources and source:
+            self.sources[fp] = source
+            self.contexts[fp] = context
+
+        # Increment counter
+        if fp not in self.counters:
+            self.counters[fp] = {"count": 0, "status": "not_compiled"}
+        self.counters[fp]["count"] += 1
+
+        # Check threshold
+        threshold = self.config["threshold"]
+        min_duration = self.config.get("min_duration", 50)
+        if (self.counters[fp]["count"] >= threshold
+                and self.counters[fp]["status"] == "not_compiled"
+                and fp not in self.compiling):
+            # When min_duration > 0, require at least one duration sample
+            # before deciding whether to compile.
+            if min_duration > 0:
+                dur_info = self.durations.get(fp)
+                if dur_info is None:
+                    return  # No timing data yet, wait for exec_duration message
+                avg_ms = dur_info.get("avg_ms", 0)
+                if avg_ms < min_duration:
+                    return  # Too fast to benefit from JIT
+            self.counters[fp]["status"] = "compiling"
+            self.compiling.add(fp)
+            asyncio.ensure_future(self._compile_worker(fp))
+
+    def _handle_exec_duration(self, msg: dict):
+        fp = msg.get("fingerprint", "")
+        ms = msg.get("duration_ms", -1)
+        if not fp or ms < 0:
+            return
+        if fp not in self.durations:
+            self.durations[fp] = {"samples": [], "avg_ms": 0}
+        dur = self.durations[fp]
+        dur["samples"].append(ms)
+        # Keep last 10 samples
+        if len(dur["samples"]) > 10:
+            dur["samples"] = dur["samples"][-10:]
+        dur["avg_ms"] = sum(dur["samples"]) / len(dur["samples"])
+
+    def _handle_register_function(self, msg: dict):
+        name = msg.get("name", "")
+        source = msg.get("source", "")
+
+        if not name:
+            return
+
+        generation = self.functions.get(name, {}).get("generation", 0)
+        if name in self.functions and self.functions[name].get("source") == source:
+            return  # No change
+
+        # Function redefined — increment generation
+        self.functions[name] = {
+            "fingerprint": msg.get("fingerprint", ""),
+            "generation": generation + 1,
+            "source": source,
+        }
+
+    async def _compile_worker(self, fingerprint: str):
+        async with self.compile_semaphore:
+            try:
+                source = self.sources.get(fingerprint, "")
+                if not source:
+                    self.counters[fingerprint]["status"] = "failed"
+                    return
+
+                python_code = await self._call_llm(source)
+                if not python_code:
+                    self.counters[fingerprint]["status"] = "failed"
+                    self._mark_failed(fingerprint, "LLM returned empty")
+                    return
+
+                # Validate
+                if not self._validate_syntax(python_code):
+                    self.counters[fingerprint]["status"] = "failed"
+                    self._mark_failed(fingerprint, "syntax check failed")
+                    return
+
+                if not self._validate_safety(python_code):
+                    self.counters[fingerprint]["status"] = "failed"
+                    self._mark_failed(fingerprint, "safety check failed")
+                    return
+
+                # Write cache
+                self._write_cache(fingerprint, python_code, source)
+                self.counters[fingerprint]["status"] = "compiled"
+
+            except Exception as e:
+                self.counters[fingerprint]["status"] = "failed"
+                self._mark_failed(fingerprint, str(e))
+            finally:
+                self.compiling.discard(fingerprint)
+
+    async def _call_llm(self, source: str) -> Optional[str]:
+        llm_config = self.config["llm"]
+        api_key = llm_config.get("api_key", "")
+        endpoint = llm_config.get("endpoint", "")
+        model = llm_config.get("model", "")
+
+        if not api_key or not endpoint or not model:
+            print(f"LLM not configured: api_key={'set' if api_key else 'missing'}, "
+                  f"endpoint={'set' if endpoint else 'missing'}, model={'set' if model else 'missing'}",
+                  file=sys.stderr)
+            return None
+
+        # Build context with function sources
+        func_context = ""
+        for name, info in self.functions.items():
+            func_context += f"\n# Function: {name}\n# {info.get('source', '')}\n"
+
+        prompt = f"""You are translating a bash script to Python for performance optimization.
+The Python code must produce IDENTICAL observable behavior.
+
+CONSTRAINTS:
+- The Python script receives positional parameters as sys.argv[1:]
+- All referenced shell variables ($VAR, ${{VAR}}) are available as os.environ["VAR"]
+- The original script path is in os.environ["BASH_JIT_SCRIPT"] (for $0, $BASH_SOURCE)
+- stdin/stdout/stderr behave identically to bash
+- Exit code: sys.exit(N) maps to bash exit code N
+
+TRANSLATION RULES:
+- Skip shebang lines (#!/usr/bin/env bash, etc.)
+- echo -> print() (handle -n, -e flags)
+- printf -> Python string formatting (f-strings or str.format)
+- test / [ / [[ -> Python boolean expressions
+- External commands -> subprocess.run(["cmd", "arg1", ...])
+- for loops -> Python for loops (native, no subprocess per iteration)
+- Arithmetic $((expr)) -> Python int expressions
+- Function definitions -> Python def functions (translate inline)
+- source / . commands -> subprocess.run(["bash", "script_path", ...])
+- $0, $BASH_SOURCE -> os.environ["BASH_JIT_SCRIPT"]
+- Positional parameters $1..$N -> sys.argv[1:]
+
+PERFORMANCE:
+- Hoist loop-invariant operations (file reads, computations) OUTSIDE loops
+- Prefer Python builtins and standard library over spawning subprocesses
+- Use os.listdir()/os.path for file operations instead of spawning ls/head/xargs
+- Batch subprocess calls when possible; avoid one-subprocess-per-iteration patterns
+- Read files once and reuse the data; do not re-read the same file inside a loop
+- Use random.sample(population, k) instead of spawning shuf — prefer random.sample over random.shuffle for sampling; random.shuffle shuffles the ENTIRE list which is O(n), while random.sample is O(k)
+- Use collections.Counter for frequency counting (faster than manual dict loops)
+- Use str.translate with str.maketrans for character replacement (replaces tr -c/tr -s, faster than regex)
+- Use str.split/sorting/builtins for text processing; avoid per-character Python loops
+- Use set/dict for membership testing (O(1)) instead of list search (O(n))
+- Use list comprehensions over for+append loops; use generator expressions for large data
+- Use "".join(parts) for string building, NOT += in loops (O(n^2) otherwise)
+- Use functools.lru_cache for repeated pure-function calls with same arguments
+- Prefer built-in functions (sum, max, min, any, all, sorted) over manual Python loops — they are C-optimized
+- Iterate over file objects directly (for line in f) instead of f.readlines() for large files
+
+SAFETY:
+- Do NOT use eval() or exec() on dynamic strings
+- Do NOT use subprocess with shell=True
+- Do NOT access the filesystem beyond what the bash code does
+
+Source to translate:
+```bash
+{source}
+```
+
+Output ONLY Python code, no explanations."""
+
+        try:
+            import urllib.request
+            import urllib.error
+
+            provider = llm_config.get("provider", "anthropic")
+            print(f"[llm] calling {provider} model={model} endpoint={endpoint}",
+                  file=sys.stderr)
+            body = json.dumps({
+                "model": model,
+                "max_tokens": llm_config.get("max_tokens", 4096),
+                "temperature": llm_config.get("temperature", 0),
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode("utf-8")
+
+            if provider == "openai":
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                }
+            else:
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+
+            loop = asyncio.get_event_loop()
+            req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+
+            def do_request():
+                try:
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if provider == "openai":
+                            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        return data.get("content", [{}])[0].get("text", "")
+                except urllib.error.HTTPError as e:
+                    error_body = e.read().decode("utf-8", errors="replace")
+                    print(f"[llm] HTTP {e.code} from {endpoint}: {error_body[:500]}",
+                          file=sys.stderr)
+                    raise
+
+            result = await loop.run_in_executor(None, do_request)
+
+            # Strip markdown code fences if present
+            if result.strip().startswith("```"):
+                lines = result.strip().split("\n")
+                lines = [l for l in lines if not l.strip().startswith("```")]
+                result = "\n".join(lines)
+
+            return result.strip()
+
+        except Exception as e:
+            print(f"[llm] call failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+    def _validate_syntax(self, code: str) -> bool:
+        try:
+            compile(code, "<string>", "exec")
+            return True
+        except SyntaxError:
+            return False
+
+    def _validate_safety(self, code: str) -> bool:
+        dangerous_patterns = [
+            "os.system(",
+            "shell=True",
+            "pickle.loads",
+            "eval(",
+            "exec(",
+        ]
+        for pattern in dangerous_patterns:
+            if pattern in code:
+                return False
+        return True
+
+    def _write_cache(self, fingerprint: str, python_code: str, source: str):
+        snippet_dir = os.path.join(self.cache_dir, fingerprint)
+        os.makedirs(snippet_dir, exist_ok=True)
+
+        # Write meta.json first (atomic)
+        meta = {
+            "source_text": source,
+            "compiled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "fingerprint": fingerprint,
+        }
+        meta_path = os.path.join(snippet_dir, "meta.json")
+        meta_tmp = meta_path + f".tmp.{os.getpid()}"
+        with open(meta_tmp, "w") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(meta_tmp, meta_path)
+
+        # Write compiled.py last (atomic — bash checks this file)
+        py_path = os.path.join(snippet_dir, "compiled.py")
+        py_tmp = py_path + f".tmp.{os.getpid()}"
+        with open(py_tmp, "w") as f:
+            f.write(python_code)
+            if not python_code.endswith("\n"):
+                f.write("\n")
+        os.replace(py_tmp, py_path)
+
+    def _mark_failed(self, fingerprint: str, error: str):
+        snippet_dir = os.path.join(self.cache_dir, fingerprint)
+        os.makedirs(snippet_dir, exist_ok=True)
+        failed_path = os.path.join(snippet_dir, "FAILED")
+        with open(failed_path, "w") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ')}: {error}\n")
+
+    async def _handle_compile(self, msg: dict) -> dict:
+        source = msg.get("source", "")
+        force = msg.get("force", False)
+
+        if not source:
+            return {"type": "compile_response", "status": "failed", "error": "no source"}
+
+        # Use pre-computed fingerprint if provided (from --stdin, computed over raw bytes)
+        fp = msg.get("fingerprint") or fnv128_hex(source)
+
+        self.sources[fp] = source
+
+        if not force and self.counters.get(fp, {}).get("status") == "compiled":
+            return {
+                "type": "compile_response",
+                "fingerprint": fp,
+                "status": "skipped",
+                "path": os.path.join(self.cache_dir, fp, "compiled.py"),
+            }
+
+        python_code = await self._call_llm(source)
+        if not python_code:
+            return {"type": "compile_response", "fingerprint": fp, "status": "failed", "error": "LLM failed"}
+
+        if not self._validate_syntax(python_code):
+            return {"type": "compile_response", "fingerprint": fp, "status": "failed", "error": "syntax error"}
+
+        self._write_cache(fp, python_code, source)
+        self.counters[fp] = {"count": 0, "status": "compiled"}
+
+        return {
+            "type": "compile_response",
+            "fingerprint": fp,
+            "status": "ok",
+            "path": os.path.join(self.cache_dir, fp, "compiled.py"),
+        }
+
+    async def _handle_exec_script(self, msg: dict):
+        """Handle whole-script execution report from bash. Trigger compilation."""
+        fp = msg.get("fingerprint", "")
+        source = msg.get("source", "")
+
+        if not fp or not source:
+            return
+
+        # Skip if already compiled or currently compiling
+        status = self.counters.get(fp, {}).get("status", "")
+        if status == "compiled" or fp in self.compiling:
+            return
+
+        self.sources[fp] = source
+        if fp not in self.counters:
+            self.counters[fp] = {"count": 0, "status": "compiling", "source_preview": source[:60]}
+        self.compiling.add(fp)
+        asyncio.ensure_future(self._compile_worker(fp))
+
+    async def _handle_compile_file(self, msg: dict) -> dict:
+        path = msg.get("path", "")
+        force = msg.get("force", False)
+
+        if not os.path.exists(path):
+            return {"type": "compile_file_response", "total": 0, "compiled": 0, "failed": 0, "snippets": []}
+
+        with open(path, "rb") as f:
+            content_bytes = f.read()
+
+        content = content_bytes.decode("utf-8", errors="replace")
+        fp = fnv128_hex(content_bytes)
+
+        compile_msg = {"source": content, "fingerprint": fp, "force": force}
+        resp = await self._handle_compile(compile_msg)
+
+        return {
+            "type": "compile_file_response",
+            "total": 1,
+            "compiled": 1 if resp.get("status") == "ok" else 0,
+            "failed": 1 if resp.get("status") == "failed" else 0,
+            "snippets": [{
+                "fingerprint": resp.get("fingerprint", fp),
+                "source_preview": content[:80],
+                "status": resp.get("status", "failed"),
+                "path": resp.get("path", ""),
+            }],
+        }
+
+    def _handle_status(self) -> dict:
+        total = len(self.counters)
+        compiled = sum(1 for v in self.counters.values() if v.get("status") == "compiled")
+        failed = sum(1 for v in self.counters.values() if v.get("status") == "failed")
+        total_exec = sum(v.get("count", 0) for v in self.counters.values())
+
+        # Top hot snippets
+        hot = sorted(self.counters.items(), key=lambda x: x[1].get("count", 0), reverse=True)[:10]
+        top_hot = []
+        for fp, info in hot:
+            top_hot.append({
+                "fingerprint": fp,
+                "source_preview": self.sources.get(fp, "")[:80],
+                "count": info.get("count", 0),
+                "status": info.get("status", "not_compiled"),
+            })
+
+        # Currently compiling / queued
+        compiling = []
+        for fp in self.compiling:
+            compiling.append({
+                "fingerprint": fp[:16],
+                "source_preview": self.sources.get(fp, "")[:80],
+            })
+
+        return {
+            "type": "status_response",
+            "uptime_seconds": int(time.time() - self.start_time),
+            "total_snippets": total,
+            "compiled_snippets": compiled,
+            "failed_snippets": failed,
+            "total_exec_events": total_exec,
+            "compiling": compiling,
+            "top_hot": top_hot,
+            "daemon_pid": os.getpid(),
+        }
+
+    def _handle_clear(self, msg: dict) -> dict:
+        scope = msg.get("scope", "all")
+        removed_files = 0
+        removed_counters = 0
+
+        to_remove = []
+        for fp, info in self.counters.items():
+            status = info.get("status", "")
+            if scope == "all" or (scope == "failed" and status == "failed") or (scope == "compiled" and status == "compiled"):
+                to_remove.append(fp)
+
+        for fp in to_remove:
+            snippet_dir = os.path.join(self.cache_dir, fp)
+            if os.path.exists(snippet_dir):
+                shutil.rmtree(snippet_dir)
+                removed_files += 1
+            removed_counters += 1
+            del self.counters[fp]
+            self.sources.pop(fp, None)
+            self.contexts.pop(fp, None)
+
+        return {
+            "type": "clear_response",
+            "removed_files": removed_files,
+            "removed_counters": removed_counters,
+        }
+
+    def _shutdown(self):
+        self._save_counters()
+        asyncio.get_event_loop().stop()
+
+    async def start(self):
+        # Ensure cache directory exists
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        # Ensure socket directory exists
+        socket_dir = os.path.dirname(self.socket_path)
+        os.makedirs(socket_dir, exist_ok=True)
+
+        # Remove stale socket
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+
+        # Start server
+        self.server = await asyncio.start_unix_server(
+            self.handle_client, path=self.socket_path
+        )
+        os.chmod(self.socket_path, 0o600)
+
+        # Signal readiness
+        ready_pipe = os.environ.get("BASH_JIT_READY_PIPE")
+        if ready_pipe:
+            try:
+                fd = int(ready_pipe)
+                os.write(fd, b'\x00')
+                os.close(fd)
+            except (OSError, ValueError):
+                pass
+
+        print(f"bash_jitd listening on {self.socket_path}", file=sys.stderr)
+
+        # Periodic counter persistence
+        asyncio.ensure_future(self._periodic_save())
+
+        # Run until stopped
+        async with self.server:
+            await self.server.serve_forever()
+
+    async def _periodic_save(self):
+        while True:
+            await asyncio.sleep(60)
+            self._save_counters()
+
+
+def main():
+    daemon = BashJITDaemon()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Handle SIGTERM gracefully
+    def handle_sigterm():
+        daemon._save_counters()
+        loop.stop()
+
+    loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+    loop.add_signal_handler(signal.SIGINT, handle_sigterm)
+
+    try:
+        loop.run_until_complete(daemon.start())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        daemon._save_counters()
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
